@@ -2,6 +2,7 @@
 Sample from the trained model with PyTorch
 """
 import os
+import sys
 import pickle
 from contextlib import nullcontext
 import torch
@@ -21,7 +22,8 @@ tokenizer = "" # override the tokenizer model path
 seed = 1337
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-dtype = "float32"
+# dtype = "float32"
+dtype = "bfloat16"
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
@@ -37,13 +39,64 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # init from a model saved in a specific directory
 checkpoint_dict = torch.load(checkpoint, map_location=device)
 gptconf = ModelArgs(**checkpoint_dict['model_args'])
+print(gptconf)
 model = Transformer(gptconf)
 state_dict = checkpoint_dict['model']
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
+    print(k, state_dict[k].shape)
+    #layer_params = state_dict[k]
+    #for a in layer_params :
+    #  for b in a :
+    #    print(type(b), end='')
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+total_params = 0
+smallest = 0
+largest = 0
+
+def print_vector (t) :
+  global total_params, smallest, largest
+  for e in t :
+    if abs(e.item()) > 0.009999 :
+      total_params += 1
+      # normalized = 56.0 + 92.742 * e.item()
+      normalized = e.item()
+      if normalized < smallest :
+        smallest = normalized
+      if normalized > largest :
+        largest = normalized
+      print(" %.2f" % e.item(), end='')
+      # print(" %x" % int(normalized), end='')
+      # print("%s" % chr(int(normalized)), end='')
+    else :
+      print(" 0", end='')
+
+'''
+for k, v in list(state_dict.items()):
+    if k == 'output.weight' or k == 'tok_embeddings.weight':
+      continue
+
+    layer_params = state_dict[k]
+    nrows = layer_params.shape[0]
+    if len(layer_params.shape) > 1 :
+      ncolumns = layer_params.shape[1]
+      print(f'\n\n--- { k } parameters form a { nrows }x{ ncolumns } matrix:', end='')
+      i = 0
+      for column in layer_params :
+        print(f'\n  -- column { i }:\n', end='')
+        i += 1
+        print_vector(column)
+    else :
+      print(f'\n\n--- { k } parameters form a { nrows }-dimensional vector:')
+      print_vector(layer_params)
+'''
+# print('\n\nTotal number of parameters:', total_params, 'Smallest value:', smallest, 'Largest', largest)
+# exit()
+
 model.load_state_dict(state_dict, strict=False)
+
 
 model.eval()
 model.to(device)
@@ -74,6 +127,10 @@ x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(enc.decode(y[0].tolist()))
-            print('---------------')
+            sys.stdout.write(enc.decode(x[0].tolist()))
+            sys.stdout.flush()
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, decoder=enc)
+            # print(enc.decode(y[0].tolist()))
+            # print('---------------')
+            sys.stdout.write('\n------------------\n')
+            sys.stdout.flush()

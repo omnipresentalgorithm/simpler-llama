@@ -1,3 +1,4 @@
+import sys
 import math
 import struct
 import inspect
@@ -127,6 +128,7 @@ class Attention(nn.Module):
 
         # QKV
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        # print('Q', self.wq.weight.shape, 'x', x.shape, 'Qx', xq.shape)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -142,6 +144,11 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
+        # print('xq', xq.shape, 'xkT', xk.transpose(2, 3).shape, 'xq * kxT', torch.matmul(xq, xk.transpose(2, 3)).shape)
+        # print(xq.shape, xk.transpose(2, 3).shape, scores.shape)
+        scores = F.softmax(torch.matmul(xq, xk.transpose(2, 3)).float(), dim=-1).type_as(xq)
+        # print('scores shape', scores.shape, 'xv shape', xv.shape)
+        #print('scores * xv shape', torch.matmul(scores, xv).shape)
 
         # flash implementation
         if self.flash:
@@ -157,6 +164,7 @@ class Attention(nn.Module):
 
         # restore time as batch dimension and concat heads
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        # print('scores x xv restored shape', output.shape)
 
         # final projection into the residual stream
         output = self.wo(output)
@@ -171,13 +179,44 @@ class FeedForward(nn.Module):
             hidden_dim = 4 * dim
             hidden_dim = int(2 * hidden_dim / 3)
             hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        # Built-in ADC
+        # self.half_hidden = int(hidden_dim / 2)
+        # self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=True)
+        # Built-in ADC
+        # self.w1 = nn.Linear(dim, self.half_hidden, bias=True)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        '''
+        Built-in ADC
+        input_full = self.w3(x)
+        input = torch.split(input_full, self.half_hidden, -1)
+        # print('i', input[0].shape, input[1].shape)
+        control = self.w1(x)
+
+        # 2 nonlinear outputs _- & _/
+        digital = F.sigmoid(control)
+        piecewise_functional = digital * control
+
+        functionally_gated = piecewise_functional * input[0]
+        digitally_switched = digital * input[1]
+        # print('f', functionally_gated.shape, 'd', digitally_switched.shape)
+        gated = torch.cat((functionally_gated, digitally_switched), -1)
+        # print('s', gated.shape)
+
+        return self.dropout(self.w2(gated))
+        '''
+
+        # The original:
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+        # Neither w3^-1 nor w2^-1 makes model better.
+        # w2_inv = torch.linalg.pinv(self.w2.weight).transpose(0, 1)
+        # return self.dropout(torch.matmul(F.silu(self.w1(x)) * self.w3(x), w3_inv))
+        # return self.dropout(self.w2(F.silu(self.w1(x)) * torch.matmul(x, w2_inv)))
 
 
 class TransformerBlock(nn.Module):
@@ -200,8 +239,11 @@ class TransformerBlock(nn.Module):
     def forward(self, x, freqs_cos, freqs_sin):
         h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
+        #h = x + self.attention.forward(x, freqs_cos, freqs_sin)
+        #out = h + self.feed_forward.forward(h)
         return out
 
+import matplotlib.pyplot as plt
 
 class Transformer(nn.Module):
     last_loss: Optional[torch.Tensor]
@@ -248,22 +290,102 @@ class Transformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
+        '''
+        total_levels = self.tok_embeddings.weight.shape[0]
+        input_distribution = torch.zeros(_bsz, seqlen, total_levels)
+        for batch in range(_bsz) :
+          for pos in range(seqlen) :
+            for level in range(total_levels) :
+              input_distribution[batch][pos][level] = 0.5 if level == tokens[batch][pos] else 0.0 # 1st batch 1st pos
+            
+            input_distribution[batch][pos][tokens[batch][pos] - 1] = 0.25
+            input_distribution[batch][pos][tokens[batch][pos] + 1] = 0.25
+
+        embedded = torch.matmul(input_distribution, self.tok_embeddings.weight)
+        # print('Embedded:', embedded[0][0])
+
+        # print('--- TOKENS:', tokens.shape, self.tok_embeddings.weight.shape, input_distribution[0])
+        h = embedded
+        '''
         h = self.tok_embeddings(tokens)
+        #I_mask = torch.eye(361)
+        #for i in range(192) :
+        #  I_mask[i][i] = 0
+
+        UNEMBED = torch.linalg.pinv(self.tok_embeddings.weight)
+        #UNEMBED = torch.linalg.inv(I_mask + torch.cat([self.tok_embeddings.weight, torch.zeros(361, 169)], dim=1))
+        #UNEMBED = torch.cat([UNEMBED[:, :192]], dim=1)
+        #UNEMBED = torch.cat([UNEMBED[:192, :]], dim=0)
+        #unembedded = torch.matmul(h, UNEMBED) #  self.tok_embeddings.weight.transpose(0, 1))
+        #unembedded = F.softmax(unembedded, dim=-1)
+        # plt.plot(unembedded[0][0])
+        # plt.show()
+        # print('--- TOKENS:', input_distribution, unembedded)
+
+        # print('--- EMBEDDED TOKENS:', h.shape, h[0][0][0], embedded[0])
         h = self.dropout(h)
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
         for layer in self.layers:
             h = layer(h, freqs_cos, freqs_sin)
+
+        grand_transformer_output = h
         h = self.norm(h)
 
         if targets is not None:
+            # Least squares loss experiment:
+            # reuse the same embedding weights & same last step RMSNorm weights:
+            # emb_targets = self.tok_embeddings(targets)
+            # print('Targets shape:', emb_targets.shape)
+            # norm_emb_targets = self.norm(emb_targets)
+            # print('RMSNormed Targets shape:', norm_emb_targets.shape)
+            # print('RMSNormed Transformer Output shape:', h.shape)
+
+            # self.last_loss = torch.sum((emb_targets - grand_transformer_output) ** 2)
+            # INV_B_SEQ = 1.0 / (emb_targets.shape[0] * emb_targets.shape[1])
+            # self.last_loss = INV_B_SEQ * torch.sum(torch.square(torch.sub(emb_targets, grand_transformer_output)))
+
             # if we are given some desired targets also calculate the loss
-            logits = self.output(h)
+            #logits = self.output(h)
+            logits = torch.matmul(h, UNEMBED)
             self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            '''
+            # The exact equivalent of the "neg-log-likelihood" loss:
+            # Sum_classes[ Sum_class[ target(class)/model(class) dmodel ] dclass
+            total_batches = 0.0
+            for batch in range(_bsz) :
+              total_positions = 0.0
+              for pos in range(seqlen) :
+                Model = F.softmax(logits[batch][pos])
+                Target = targets[batch][pos]
+                total_classes = 0.0
+                for cl in range(len(logits[batch][pos])) :
+                  t_cl = 1.0 if Target == cl else 0.0
+                  m_cl = Model[cl]
+                  integral = 0.0
+                  for m_inst in range(10000) :
+                    if m_inst >= m_cl * 10000 :
+                      dm = (1/10000)
+                      m = m_inst * dm
+                      rat = t_cl / m
+                      integral += rat * dm
+                  total_classes += integral
+                total_positions += total_classes
+              total_batches += total_positions / seqlen
+            total_batches = total_batches / _bsz
+            '''
+            # print('Last Loss', self.last_loss, total_batches)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            #logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            #logits = torch.matmul(h[:, [-1], :], self.tok_embeddings.weight.transpose(0, 1))
+            logits = torch.matmul(h[:, [-1], :], UNEMBED) #  self.tok_embeddings.weight.transpose(0, 1))
+            #plt.plot(logits[0][0])
+            #plt.show()
+
+            # print('--- UNEMBEDDED TOKENS:', h.shape, h[0][0][0])
             self.last_loss = None
 
         return logits
@@ -289,7 +411,13 @@ class Transformer(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
+        # TODO: LLaMA paper AdamW optimizer (β1 = 0.9, β2 = 0.95)
+        # with cosine learning rate schedule the final learning rate is equal to 10% of the maxim. LR.
+        # Weight decay of 0.1 and gradient clipping of 1.0 with 2000 warmup steps.
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        # SGD doesn't learn at all
+        # optimizer = torch.optim.SGD(optim_groups, lr=learning_rate * 0.05, momentum=0.9, **extra_args)
+        # print("Using SGD with momentum.")
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
@@ -311,7 +439,7 @@ class Transformer(nn.Module):
         return mfu
 
     @torch.inference_mode()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, decoder=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -337,6 +465,12 @@ class Transformer(nn.Module):
                 # apply softmax to convert logits to (normalized) probabilities
                 probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
+
+            decoded_character = decoder.decode(idx_next[0].tolist())
+            if decoded_character == '':
+              decoded_character = ' '
+            sys.stdout.write(decoded_character)
+            sys.stdout.flush()
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 

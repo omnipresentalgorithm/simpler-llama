@@ -102,15 +102,20 @@ def train_vocab(vocab_size):
     print("Will now train the vocab...")
     spm.SentencePieceTrainer.train(input=tiny_file,
                                    model_prefix=prefix,
-                                   model_type="bpe",
+                                   # model_type="bpe",
+                                   model_type="char",
                                    vocab_size=vocab_size,
                                    self_test_sample_size=0,
                                    input_format="text",
                                    character_coverage=1.0,
                                    num_threads=os.cpu_count(),
                                    split_digits=True,
-                                   allow_whitespace_only_pieces=True,
-                                   byte_fallback=True,
+                                   # allow_whitespace_only_pieces=True,
+                                   allow_whitespace_only_pieces=False,
+                                   use_all_vocab=True,
+                                   # byte_fallback=True,
+                                   byte_fallback=False,
+                                     hard_vocab_limit=True,
                                    unk_surface=r" \342\201\207 ",
                                    normalization_rule_name="identity")
 
